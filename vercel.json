@@ -2,7 +2,7 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/app.py", // Updated path
+      "src": "api/app.py", 
       "use": "@vercel/python",
       "config": {
         "pythonVersion": "3.9"
@@ -12,7 +12,7 @@
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "api/app.py" // Updated path
+      "dest": "api/app.py" 
     }
   ]
 }
