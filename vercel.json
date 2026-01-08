@@ -3,7 +3,10 @@
   "builds": [
     {
       "src": "api/app.py", // Updated path
-      "use": "@vercel/python"
+      "use": "@vercel/python",
+      "config": {
+        "pythonVersion": "3.9"
+      }
     }
   ],
   "routes": [
