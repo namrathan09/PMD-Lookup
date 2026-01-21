@@ -55,7 +55,9 @@ def process_files():
             pmd_df = pmd_df[~pmd_df['Country'].isin(countries_to_exclude)]
             app.logger.info(f"Removed {initial_rows - len(pmd_df)} rows where 'Country' was in {countries_to_exclude}.")
 
-        required_central_cols = ['Valid From', 'Supplier Name']
+        # --- Updated Required Columns ---
+        # 'Status' column is now required in the Central File for comparison logic
+        required_central_cols = ['Valid From', 'Supplier Name', 'Status'] 
         required_pmd_cols = ['Valid From', 'Supplier Name']
 
         if not all(col in central_df.columns for col in required_central_cols):
@@ -69,40 +71,83 @@ def process_files():
         pmd_df['Valid From_dt'] = pd.to_datetime(pmd_df['Valid From'], errors='coerce')
             
         # Drop rows where essential comparison data is missing (NaT for date, or NaN for Supplier Name)
-        central_df.dropna(subset=['Valid From_dt', 'Supplier Name'], inplace=True)
+        # Added 'Status' for NA check in central_df as it's now critical for logic
+        central_df.dropna(subset=['Valid From_dt', 'Supplier Name', 'Status'], inplace=True)
         pmd_df.dropna(subset=['Valid From_dt', 'Supplier Name'], inplace=True)
-        app.logger.info("Date columns normalized and rows with missing comparison data dropped.")
+        app.logger.info("Date columns normalized and rows with missing comparison data and required 'Status' dropped.")
 
         central_df['comp_key'] = central_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' + central_df['Supplier Name'].astype(str)
         pmd_df['comp_key'] = pmd_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' + pmd_df['Supplier Name'].astype(str)
         app.logger.info("Comparison keys created for both DataFrames (Valid From AND Supplier Name).")
 
-        unique_pmd_rows = pmd_df[~pmd_df['comp_key'].isin(central_df['comp_key'])].copy()
-        app.logger.info(f"Identified {len(unique_pmd_rows)} unique rows from PMD Lookup Data for output.")
+        # --- New Status Logic ---
+        # Perform a left merge from pmd_df to central_df to bring in Central's Status for matching records
+        # This allows us to check Central's status even for rows that "match"
+        merged_df = pd.merge(pmd_df, central_df[['comp_key', 'Status']], 
+                             on='comp_key', 
+                             how='left', 
+                             suffixes=('_pmd', '_central'))
+        app.logger.info("PMD Lookup Data merged with Central File's status information based on comp_key.")
+
+        # Determine the 'final_status' for each row based on the new rules
+        def determine_final_status(row):
+            # Scenario 1: No match found in central_df (Status_central is NaN)
+            if pd.isna(row['Status_central']):
+                return 'New'
+            # Scenarios 2 & 3: Match found, check central status
+            else:
+                # Scenario 2: Match found AND Central Status is "Approved" (case-insensitive)
+                if row['Status_central'].lower() == 'approved': 
+                    return None # This row should be ignored, so we return None
+                # Scenario 3: Match found BUT Central Status is NOT "Approved"
+                else:
+                    return 'Hold' # Include this row, status is "Hold"
+
+        merged_df['final_status'] = merged_df.apply(determine_final_status, axis=1)
+        app.logger.info("Calculated 'New', 'Hold', or 'None' for each PMD record based on matching and Central Status.")
+
+        # Filter out rows that should be ignored (where final_status is None)
+        final_output_df = merged_df[merged_df['final_status'].notna()].copy()
+
+        # Assign the calculated 'final_status' to the new 'Status' column in the output DataFrame
+        final_output_df['Status'] = final_output_df['final_status'] 
+        app.logger.info(f"Filtered to {len(final_output_df)} records for final output after applying status logic.")
 
         # --- Output File Generation ---
         output_required_cols = [
             'Valid From', 'Bukr.', 'Type', 'EBSNO', 'Supplier Name', 'Street',
             'City', 'Country', 'Zip Code', 'Requested By', 'Pur. approver',
-            'Pur. release date'
+            'Pur. release date', 'Status' # Added 'Status' to output columns
         ]
 
-        # Filter the unique_pmd_rows to only include the required output columns
-        available_output_cols = [col for col in output_required_cols if col in unique_pmd_rows.columns]
-        final_output_df = unique_pmd_rows[available_output_cols].copy() 
+        # Select columns that originated from pmd_df (excluding comp_key, Valid From_dt_pmd, Status_central, final_status)
+        # and then add the new 'Status' column
         
-        # Format 'Valid From' if 'Valid From_dt' exists in unique_pmd_rows
-        # This needs to be done *before* dropping 'Valid From_dt' if the original 'Valid From' column is desired
-        if 'Valid From_dt' in unique_pmd_rows.columns:
-            final_output_df['Valid From'] = unique_pmd_rows['Valid From_dt'].dt.strftime('%Y-%m-%d %I:%M %p')
+        # We need to ensure we're working with the columns from the original PMD file
+        # plus the newly created 'Status' column.
+        # Let's get the original PMD columns for selection.
+        original_pmd_columns = [col for col in pmd_df.columns if col not in ['comp_key', 'Valid From_dt']]
         
-        # Clean up helper columns (comp_key and Valid From_dt)
-        # Ensure 'Valid From_dt' is dropped if it was an internal helper column, not the original 'Valid From'
-        final_output_df.drop(columns=['comp_key', 'Valid From_dt'], errors='ignore', inplace=True)
+        # Ensure 'Valid From' is formatted correctly before final selection
+        # Check if the Valid From from the pmd_df is a datetime object after initial processing
+        if 'Valid From_dt_pmd' in final_output_df.columns and final_output_df['Valid From_dt_pmd'].dtype == 'datetime64[ns]':
+            final_output_df['Valid From'] = final_output_df['Valid From_dt_pmd'].dt.strftime('%Y-%m-%d %I:%M %p')
+        elif 'Valid From_dt' in final_output_df.columns and final_output_df['Valid From_dt'].dtype == 'datetime64[ns]': # Fallback for if suffix wasn't added due to no conflict
+             final_output_df['Valid From'] = final_output_df['Valid From_dt'].dt.strftime('%Y-%m-%d %I:%M %p')
         
-        # Reorder columns to match output_required_cols
+        # Now drop all the temporary helper columns and the merged central status
+        columns_to_drop_after_status_calc = [
+            'comp_key', 'Valid From_dt_pmd', 'Valid From_dt_central', # from merged_df
+            'Valid From_dt', # from pmd_df if suffix not applied
+            'Status_central', 'final_status'
+        ]
+        final_output_df.drop(columns=[col for col in columns_to_drop_after_status_calc if col in final_output_df.columns], 
+                             errors='ignore', 
+                             inplace=True)
+        
+        # Reorder columns to match output_required_cols, including the new 'Status'
         final_output_df = final_output_df[[col for col in output_required_cols if col in final_output_df.columns]]
-
+        
         app.logger.info("Final output DataFrame prepared and formatted.")
 
         output = io.BytesIO()
