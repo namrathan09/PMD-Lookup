@@ -71,12 +71,18 @@ def process_files():
             app.logger.info(f"Removed {initial_rows_pmd - len(pmd_df)} rows from PMD where 'Country' was in {countries_to_exclude}.")
 
         # --- Required Columns Check ---
-        # 'Status' and 'Assigned To' are required in the Central File for comparison and data fetching
-        required_central_cols_for_check = ['Valid From', 'Supplier Name', 'Status', 'Assigned To']
+        # 'Status' and 'Assigned' (corrected) are required in the Central File
+        # for comparison and data fetching
+        # --- CHANGE START ---
+        REQUIRED_ASSIGNED_COL_NAME = 'Assigned' # Define the exact column name here
+        required_central_cols_for_check = ['Valid From', 'Supplier Name', 'Status', REQUIRED_ASSIGNED_COL_NAME]
+        # --- CHANGE END ---
         required_pmd_cols_for_check = ['Valid From', 'Supplier Name']
 
         if not all(col in central_df.columns for col in required_central_cols_for_check):
-            flash(f"Central File is missing one or more required columns: {required_central_cols_for_check}. Please ensure 'Assigned To' is present.", 'error')
+            # --- CHANGE START ---
+            flash(f"Central File is missing one or more required columns: {required_central_cols_for_check}. Please ensure '{REQUIRED_ASSIGNED_COL_NAME}' is present.", 'error')
+            # --- CHANGE END ---
             return redirect(url_for('index'))
         if not all(col in pmd_df.columns for col in required_pmd_cols_for_check):
             flash(f"PMD Lookup Data File is missing one or more required columns: {required_pmd_cols_for_check}.", 'error')
@@ -87,53 +93,61 @@ def process_files():
         pmd_df['Valid From_dt'] = pd.to_datetime(pmd_df['Valid From'], errors='coerce')
 
         # Drop rows where essential comparison/output data is missing
-        central_df.dropna(subset=['Valid From_dt', 'Supplier Name', 'Status', 'Assigned To'], inplace=True)
+        # --- CHANGE START ---
+        central_df.dropna(subset=['Valid From_dt', 'Supplier Name', 'Status', REQUIRED_ASSIGNED_COL_NAME], inplace=True)
+        # --- CHANGE END ---
         pmd_df.dropna(subset=['Valid From_dt', 'Supplier Name'], inplace=True)
-        app.logger.info("Date columns normalized and rows with missing comparison data or required 'Status'/'Assigned To' dropped.")
+        app.logger.info("Date columns normalized and rows with missing comparison data or required 'Status'/'Assigned' dropped.")
 
         # 4. Create Comparison Keys
         central_df['comp_key'] = central_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' + central_df['Supplier Name'].astype(str)
         pmd_df['comp_key'] = pmd_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' + pmd_df['Supplier Name'].astype(str)
         app.logger.info("Comparison keys created for both DataFrames (Valid From AND Supplier Name).")
 
-        # --- 5. Status Logic & Assigned To Fetching ---
-        # Perform a left merge from pmd_df to central_df to bring in Central's Status and Assigned To
+        # --- 5. Status Logic & Assigned Fetching ---
+        # Perform a left merge from pmd_df to central_df to bring in Central's Status and Assigned
         # for matching records based on the composite key.
+        # --- CHANGE START ---
         merged_df = pd.merge(pmd_df,
-                             central_df[['comp_key', 'Status', 'Assigned To']].rename(
-                                 columns={'Status': 'Status_central', 'Assigned To': 'Assigned To_central'}),
+                             central_df[['comp_key', 'Status', REQUIRED_ASSIGNED_COL_NAME]].rename(
+                                 columns={'Status': 'Status_central', REQUIRED_ASSIGNED_COL_NAME: 'Assigned_central'}),
                              on='comp_key',
                              how='left')
-        app.logger.info("PMD Lookup Data merged with Central File's status and 'Assigned To' information based on comp_key.")
+        # --- CHANGE END ---
+        app.logger.info("PMD Lookup Data merged with Central File's status and 'Assigned' information based on comp_key.")
 
         # Define the function to determine the final status and assigned person
         def determine_final_output_details(row):
             # Scenario 1: No match found in central_df (Status_central is NaN)
             if pd.isna(row['Status_central']):
-                return 'New', None # Status 'New', no 'Assigned To'
+                return 'New', None # Status 'New', no 'Assigned' person
 
             # Scenarios 2 & 3: Match found, check central status
             else:
                 # Scenario 2: Match found AND Central Status is "Approved" (case-insensitive)
                 if isinstance(row['Status_central'], str) and row['Status_central'].lower() == 'approved':
-                    return None, None # This row should be ignored, so return None for both status and assigned_to
+                    return None, None # This row should be ignored, so return None for both status and assigned
                 # Scenario 3: Match found BUT Central Status is NOT "Approved"
                 else:
-                    # Status is 'Hold', and fetch 'Assigned To' from the central file's corresponding record
-                    return 'Hold', row['Assigned To_central']
+                    # Status is 'Hold', and fetch 'Assigned' from the central file's corresponding record
+                    # --- CHANGE START ---
+                    return 'Hold', row['Assigned_central']
+                    # --- CHANGE END ---
 
-        # Apply the function to create 'final_status' and 'final_assigned_to' columns
-        merged_df[['final_status', 'final_assigned_to']] = merged_df.apply(
+        # Apply the function to create 'final_status' and 'final_assigned_person' columns
+        merged_df[['final_status', 'final_assigned_person']] = merged_df.apply(
             lambda row: determine_final_output_details(row), axis=1, result_type='expand'
         )
-        app.logger.info("Calculated 'New', 'Hold', or 'None' for each PMD record, and fetched 'Assigned To' where applicable.")
+        app.logger.info("Calculated 'New', 'Hold', or 'None' for each PMD record, and fetched 'Assigned' where applicable.")
 
         # Filter out rows that should be ignored (where final_status is None)
         final_output_df = merged_df[merged_df['final_status'].notna()].copy()
 
-        # Assign the calculated 'final_status' and 'final_assigned_to' to the output DataFrame's new columns
+        # Assign the calculated 'final_status' and 'final_assigned_person' to the output DataFrame's new columns
         final_output_df['Status'] = final_output_df['final_status']
-        final_output_df['Assigned To'] = final_output_df['final_assigned_to']
+        # --- CHANGE START ---
+        final_output_df['Assigned'] = final_output_df['final_assigned_person']
+        # --- CHANGE END ---
         app.logger.info(f"Filtered to {len(final_output_df)} records for final output after applying status logic.")
 
         # --- 6. Output File Generation ---
@@ -141,7 +155,7 @@ def process_files():
         output_required_cols = [
             'Valid From', 'Bukr.', 'Type', 'EBSNO', 'Supplier Name', 'Street',
             'City', 'Country', 'Zip Code', 'Requested By', 'Pur. approver',
-            'Pur. release date', 'Status', 'Assigned To' # 'Assigned To' is now included
+            'Pur. release date', 'Status', 'Assigned' # 'Assigned' is now included
         ]
 
         # Ensure 'Valid From' column is formatted correctly for the output.
@@ -152,7 +166,7 @@ def process_files():
         # Clean up helper columns created during processing
         columns_to_drop_after_status_calc = [
             'comp_key', 'Valid From_dt', 'Valid From_dt_pmd', 'Valid From_dt_central', # Valid From_dt_pmd/central might exist due to suffixes
-            'Status_central', 'Assigned To_central', 'final_status', 'final_assigned_to'
+            'Status_central', 'Assigned_central', 'final_status', 'final_assigned_person' # 'Assigned_central'
         ]
 
         final_output_df.drop(columns=[col for col in columns_to_drop_after_status_calc if col in final_output_df.columns],
@@ -178,7 +192,9 @@ def process_files():
     # --- Error Handling ---
     except KeyError as e:
         app.logger.error(f"Missing expected column in one of the Excel files: {e}", exc_info=True)
-        flash(f"Error: One of the uploaded files is missing a required column: '{e}'. Please check your file headers. Required columns for Central File include 'Valid From', 'Supplier Name', 'Status', 'Assigned To'. For PMD Lookup: 'Valid From', 'Supplier Name'.", 'error')
+        # --- CHANGE START ---
+        flash(f"Error: One of the uploaded files is missing a required column: '{e}'. Please check your file headers. Required columns for Central File include 'Valid From', 'Supplier Name', 'Status', '{REQUIRED_ASSIGNED_COL_NAME}'. For PMD Lookup: 'Valid From', 'Supplier Name'.", 'error')
+        # --- CHANGE END ---
         return redirect(url_for('index'))
     except pd.errors.EmptyDataError:
         app.logger.error("Uploaded Excel file is empty or unreadable.", exc_info=True)
