@@ -1,211 +1,139 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, send_file
 import pandas as pd
-import os
 import io
 import logging
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key_here' # IMPORTANT: Change this to a strong, random key in production!
+app.secret_key = 'your_secret_key_here'  # change in production
 
-# Configure logging
+# Logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Allowed file extensions for uploads
 ALLOWED_EXTENSIONS = {'xls', 'xlsx'}
 
+
 def allowed_file(filename):
-    """
-    Checks if the uploaded filename has an allowed Excel extension.
-    """
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 
 @app.route('/', methods=['GET'])
 def index():
-    """
-    Renders the main page with the file upload forms.
-    """
     return render_template('index.html')
+
 
 @app.route('/process', methods=['POST'])
 def process_files():
-    """
-    Handles the file uploads, processes the data, and returns an Excel file.
-    """
-    # 1. Validate file uploads
-    if 'central_file' not in request.files or 'pmd_lookup_file' not in request.files:
-        flash('One or both files are missing from the upload.', 'error')
-        return redirect(url_for('index'))
-
-    central_file = request.files['central_file']
-    pmd_lookup_file = request.files['pmd_lookup_file']
-
-    if central_file.filename == '' or pmd_lookup_file.filename == '':
-        flash('Please select both a Central File and a PMD Lookup Data File.', 'error')
-        return redirect(url_for('index'))
-
-    if not (allowed_file(central_file.filename) and allowed_file(pmd_lookup_file.filename)):
-        flash('Invalid file type. Please upload .xls or .xlsx files only for both files.', 'error')
-        return redirect(url_for('index'))
-
     try:
-        app.logger.info("Starting file processing...")
+        # -------------------- FILE VALIDATION --------------------
+        if 'central_file' not in request.files or 'pmd_lookup_file' not in request.files:
+            flash('Both files are required.', 'error')
+            return redirect(url_for('index'))
 
-        # 2. Read Excel files into Pandas DataFrames
+        central_file = request.files['central_file']
+        pmd_file = request.files['pmd_lookup_file']
+
+        if central_file.filename == '' or pmd_file.filename == '':
+            flash('Please select both files.', 'error')
+            return redirect(url_for('index'))
+
+        if not (allowed_file(central_file.filename) and allowed_file(pmd_file.filename)):
+            flash('Only Excel files (.xls, .xlsx) are allowed.', 'error')
+            return redirect(url_for('index'))
+
+        # -------------------- READ FILES --------------------
         central_df = pd.read_excel(io.BytesIO(central_file.read()))
-        pmd_df = pd.read_excel(io.BytesIO(pmd_lookup_file.read()))
-        app.logger.info("Files successfully read into DataFrames.")
+        pmd_df = pd.read_excel(io.BytesIO(pmd_file.read()))
 
-        # --- PMD Lookup Data File Initial Processing ---
-        # Drop specified columns from PMD Lookup DataFrame if they exist
-        cols_to_drop = ['Sl. No.', 'DUNS']
-        pmd_df = pmd_df.drop(columns=[col for col in cols_to_drop if col in pmd_df.columns], errors='ignore')
-        app.logger.info(f"Dropped columns {cols_to_drop} from PMD Lookup DataFrame.")
+        # -------------------- REQUIRED COLUMNS --------------------
+        central_required = ['Valid From', 'Supplier Name', 'Status', 'Assigned']
+        pmd_required = ['Valid From', 'Supplier Name']
 
-        # Remove rows where 'Country' is in the specified exclusion list
-        countries_to_exclude = ['CN', 'ID', 'TW', 'HK', 'JP', 'KR', 'MY', 'PH', 'SG', 'TH', 'VN']
-        if 'Country' in pmd_df.columns:
-            initial_rows_pmd = len(pmd_df)
-            pmd_df = pmd_df[~pmd_df['Country'].isin(countries_to_exclude)]
-            app.logger.info(f"Removed {initial_rows_pmd - len(pmd_df)} rows from PMD where 'Country' was in {countries_to_exclude}.")
+        for col in central_required:
+            if col not in central_df.columns:
+                raise KeyError(f"Central file missing column: {col}")
 
-        # --- Required Columns Check ---
-        # 'Status' and 'Assigned' (corrected) are required in the Central File
-        # for comparison and data fetching
-        # --- CHANGE START ---
-        REQUIRED_ASSIGNED_COL_NAME = 'Assigned' # Define the exact column name here
-        required_central_cols_for_check = ['Valid From', 'Supplier Name', 'Status', REQUIRED_ASSIGNED_COL_NAME]
-        # --- CHANGE END ---
-        required_pmd_cols_for_check = ['Valid From', 'Supplier Name']
+        for col in pmd_required:
+            if col not in pmd_df.columns:
+                raise KeyError(f"PMD file missing column: {col}")
 
-        if not all(col in central_df.columns for col in required_central_cols_for_check):
-            # --- CHANGE START ---
-            flash(f"Central File is missing one or more required columns: {required_central_cols_for_check}. Please ensure '{REQUIRED_ASSIGNED_COL_NAME}' is present.", 'error')
-            # --- CHANGE END ---
-            return redirect(url_for('index'))
-        if not all(col in pmd_df.columns for col in required_pmd_cols_for_check):
-            flash(f"PMD Lookup Data File is missing one or more required columns: {required_pmd_cols_for_check}.", 'error')
-            return redirect(url_for('index'))
-
-        # 3. Date Normalization and Data Cleaning
+        # -------------------- DATE NORMALIZATION --------------------
         central_df['Valid From_dt'] = pd.to_datetime(central_df['Valid From'], errors='coerce')
         pmd_df['Valid From_dt'] = pd.to_datetime(pmd_df['Valid From'], errors='coerce')
 
-        # Drop rows where essential comparison/output data is missing
-        # --- CHANGE START ---
-        central_df.dropna(subset=['Valid From_dt', 'Supplier Name', 'Status', REQUIRED_ASSIGNED_COL_NAME], inplace=True)
-        # --- CHANGE END ---
+        central_df.dropna(subset=['Valid From_dt', 'Supplier Name'], inplace=True)
         pmd_df.dropna(subset=['Valid From_dt', 'Supplier Name'], inplace=True)
-        app.logger.info("Date columns normalized and rows with missing comparison data or required 'Status'/'Assigned' dropped.")
 
-        # 4. Create Comparison Keys
-        central_df['comp_key'] = central_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' + central_df['Supplier Name'].astype(str)
-        pmd_df['comp_key'] = pmd_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' + pmd_df['Supplier Name'].astype(str)
-        app.logger.info("Comparison keys created for both DataFrames (Valid From AND Supplier Name).")
-
-        # --- 5. Status Logic & Assigned Fetching ---
-        # Perform a left merge from pmd_df to central_df to bring in Central's Status and Assigned
-        # for matching records based on the composite key.
-        # --- CHANGE START ---
-        merged_df = pd.merge(pmd_df,
-                             central_df[['comp_key', 'Status', REQUIRED_ASSIGNED_COL_NAME]].rename(
-                                 columns={'Status': 'Status_central', REQUIRED_ASSIGNED_COL_NAME: 'Assigned_central'}),
-                             on='comp_key',
-                             how='left')
-        # --- CHANGE END ---
-        app.logger.info("PMD Lookup Data merged with Central File's status and 'Assigned' information based on comp_key.")
-
-        # Define the function to determine the final status and assigned person
-        def determine_final_output_details(row):
-            # Scenario 1: No match found in central_df (Status_central is NaN)
-            if pd.isna(row['Status_central']):
-                return 'New', None # Status 'New', no 'Assigned' person
-
-            # Scenarios 2 & 3: Match found, check central status
-            else:
-                # Scenario 2: Match found AND Central Status is "Approved" (case-insensitive)
-                if isinstance(row['Status_central'], str) and row['Status_central'].lower() == 'approved':
-                    return None, None # This row should be ignored, so return None for both status and assigned
-                # Scenario 3: Match found BUT Central Status is NOT "Approved"
-                else:
-                    # Status is 'Hold', and fetch 'Assigned' from the central file's corresponding record
-                    # --- CHANGE START ---
-                    return 'Hold', row['Assigned_central']
-                    # --- CHANGE END ---
-
-        # Apply the function to create 'final_status' and 'final_assigned_person' columns
-        merged_df[['final_status', 'final_assigned_person']] = merged_df.apply(
-            lambda row: determine_final_output_details(row), axis=1, result_type='expand'
+        # -------------------- CREATE MATCH KEY --------------------
+        central_df['comp_key'] = (
+            central_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' +
+            central_df['Supplier Name'].astype(str).str.strip()
         )
-        app.logger.info("Calculated 'New', 'Hold', or 'None' for each PMD record, and fetched 'Assigned' where applicable.")
 
-        # Filter out rows that should be ignored (where final_status is None)
-        final_output_df = merged_df[merged_df['final_status'].notna()].copy()
+        pmd_df['comp_key'] = (
+            pmd_df['Valid From_dt'].dt.strftime('%Y-%m-%d') + '__' +
+            pmd_df['Supplier Name'].astype(str).str.strip()
+        )
 
-        # Assign the calculated 'final_status' and 'final_assigned_person' to the output DataFrame's new columns
-        final_output_df['Status'] = final_output_df['final_status']
-        # --- CHANGE START ---
-        final_output_df['Assigned'] = final_output_df['final_assigned_person']
-        # --- CHANGE END ---
-        app.logger.info(f"Filtered to {len(final_output_df)} records for final output after applying status logic.")
+        # -------------------- CENTRAL LOOKUP (NO JOIN) --------------------
+        central_lookup = central_df.set_index('comp_key')[['Status', 'Assigned']]
 
-        # --- 6. Output File Generation ---
-        # Define the desired order and inclusion of columns for the final output Excel
-        output_required_cols = [
+        # -------------------- BUSINESS LOGIC --------------------
+        def determine_status(row):
+            # No match → New
+            if row['comp_key'] not in central_lookup.index:
+                return 'New', None
+
+            central_status = central_lookup.loc[row['comp_key'], 'Status']
+            central_assigned = central_lookup.loc[row['comp_key'], 'Assigned']
+
+            # Match + Approved → Ignore
+            if isinstance(central_status, str) and central_status.lower() == 'approved':
+                return None, None
+
+            # Match + Not Approved → Hold
+            return 'Hold', central_assigned
+
+        pmd_df[['Status', 'Assigned']] = pmd_df.apply(
+            lambda r: determine_status(r),
+            axis=1,
+            result_type='expand'
+        )
+
+        # Remove ignored rows
+        final_df = pmd_df[pmd_df['Status'].notna()].copy()
+
+        # -------------------- FORMAT & OUTPUT --------------------
+        final_df['Valid From'] = final_df['Valid From_dt'].dt.strftime('%Y-%m-%d %I:%M %p')
+
+        output_columns = [
             'Valid From', 'Bukr.', 'Type', 'EBSNO', 'Supplier Name', 'Street',
             'City', 'Country', 'Zip Code', 'Requested By', 'Pur. approver',
-            'Pur. release date', 'Status', 'Assigned' # 'Assigned' is now included
+            'Pur. release date', 'Status', 'Assigned'
         ]
 
-        # Ensure 'Valid From' column is formatted correctly for the output.
-        # It takes the datetime object we created earlier and formats it as a string.
-        if 'Valid From_dt' in final_output_df.columns:
-            final_output_df['Valid From'] = final_output_df['Valid From_dt'].dt.strftime('%Y-%m-%d %I:%M %p')
+        final_df = final_df[[col for col in output_columns if col in final_df.columns]]
 
-        # Clean up helper columns created during processing
-        columns_to_drop_after_status_calc = [
-            'comp_key', 'Valid From_dt', 'Valid From_dt_pmd', 'Valid From_dt_central', # Valid From_dt_pmd/central might exist due to suffixes
-            'Status_central', 'Assigned_central', 'final_status', 'final_assigned_person' # 'Assigned_central'
-        ]
-
-        final_output_df.drop(columns=[col for col in columns_to_drop_after_status_calc if col in final_output_df.columns],
-                             errors='ignore',
-                             inplace=True)
-
-        # Select and reorder columns to match 'output_required_cols'
-        final_output_df = final_output_df[[col for col in output_required_cols if col in final_output_df.columns]]
-
-        app.logger.info("Final output DataFrame prepared and formatted.")
-
-        # 7. Create an in-memory Excel file and send it for download
+        # -------------------- CREATE EXCEL --------------------
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            final_output_df.to_excel(writer, index=False, sheet_name='Comparison_Result')
-        output.seek(0) # Reset stream position to the beginning
-        app.logger.info("Result Excel file created in memory.")
+            final_df.to_excel(writer, index=False, sheet_name='Result')
 
-        flash('Files processed successfully! Your download should start shortly.', 'success')
-        return send_file(output, as_attachment=True, download_name='PMD_Lookup_ResultFile.xlsx',
-                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        output.seek(0)
 
-    # --- Error Handling ---
-    except KeyError as e:
-        app.logger.error(f"Missing expected column in one of the Excel files: {e}", exc_info=True)
-        # --- CHANGE START ---
-        flash(f"Error: One of the uploaded files is missing a required column: '{e}'. Please check your file headers. Required columns for Central File include 'Valid From', 'Supplier Name', 'Status', '{REQUIRED_ASSIGNED_COL_NAME}'. For PMD Lookup: 'Valid From', 'Supplier Name'.", 'error')
-        # --- CHANGE END ---
-        return redirect(url_for('index'))
-    except pd.errors.EmptyDataError:
-        app.logger.error("Uploaded Excel file is empty or unreadable.", exc_info=True)
-        flash("Error: One of the uploaded Excel files appears to be empty or unreadable.", 'error')
-        return redirect(url_for('index'))
+        flash('File processed successfully!', 'success')
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name='PMD_Lookup_Result.xlsx',
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
     except Exception as e:
-        app.logger.error(f'An unexpected error occurred during processing: {e}', exc_info=True)
-        flash(f'An unexpected error occurred: {e}', 'error')
+        logging.error(str(e), exc_info=True)
+        flash(f"Error: {e}", 'error')
         return redirect(url_for('index'))
+
 
 if __name__ == '__main__':
-    # Run the Flask app in debug mode.
-    # IMPORTANT: Set debug=False in a production environment!
     app.run(debug=True)
